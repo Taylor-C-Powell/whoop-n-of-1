@@ -1,264 +1,504 @@
-"""What a month of my WHOOP data actually predicted — n-of-1 analysis.
+"""What a month of my WHOOP data actually predicted: an n-of-1 analysis.
 
-Reproduces every number and figure in the article from the files in ./data.
-Run:  python analyze.py      (writes figures/*.png and results.md)
+Reproduces every number and figure in ARTICLE.md from the files in ./data.
 
-Design notes
-- WHOOP cycles are keyed to the *wake-onset* date (the morning a recovery score
-  applies to). Keying to cycle-start time silently shifts every record one day
-  earlier relative to same-day self-logs; Section A shows how much that matters.
-- Everything here is exploratory: one subject, 21–31 usable days, many tests,
-  autocorrelated days. p-values are reported for calibration, not for belief.
+    python analyze.py        # writes figures/*.png, results.md, results.json
+    python -m pytest -q      # checks the alignment rules the article depends on
+
+Alignment rules (each has a test in tests/test_alignment.py)
+1. Recovery, HRV, RHR and the sleep fields in a WHOOP cycle row describe the
+   sleep that ended at `Wake onset`, so they are keyed to the wake-onset date.
+   Keying them to cycle start moves a night one day early whenever sleep began
+   before midnight, and leaves it in place when sleep began after midnight.
+2. `Day Strain` in the same row accrues from cycle start to cycle end, so it is
+   keyed to the waking day the cycle covers (the date of the cycle midpoint).
+   Rules 1 and 2 usually give the same date. They differ when the night at the
+   start of a cycle was not recorded: that row's strain belongs to the day
+   *before* its wake date.
+3. One scored sleep per wake date: the longest. Mornings with more than one
+   scored sleep are flagged as fragmented, and the lag analysis is reported
+   with and without them.
+4. "Prior day" is the previous calendar day, found by shifting dates, never by
+   taking the previous row.
+5. A predictor of the recovery score has to exist before the score does. The
+   score is computed at wake, so logged behaviours enter with a one-day lag.
+
+Everything here is exploratory: one subject, about four weeks, many tests,
+autocorrelated days. p-values are reported for calibration, not for belief.
 """
 from __future__ import annotations
 
 import json
-import warnings
 from pathlib import Path
 
 import matplotlib
+
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 from scipy import stats
 from sklearn.ensemble import RandomForestRegressor
-from sklearn.linear_model import LinearRegression
 
-warnings.filterwarnings("ignore")
 HERE = Path(__file__).resolve().parent
 DATA, FIG = HERE / "data", HERE / "figures"
-FIG.mkdir(exist_ok=True)
 
-# ---- palette (light surface; 3 categorical slots validated all-pairs) ----
-BLUE, ORANGE, AQUA = "#2a78d6", "#eb6834", "#1baf7a"
-INK, MUTED, GRID, SURFACE = "#0b0b0b", "#52514e", "#e6e4df", "#fcfcfb"
-plt.rcParams.update({
-    "figure.facecolor": SURFACE, "axes.facecolor": SURFACE, "axes.edgecolor": GRID,
-    "axes.labelcolor": INK, "xtick.color": MUTED, "ytick.color": MUTED,
-    "axes.grid": True, "grid.color": GRID, "grid.linewidth": 0.8,
-    "axes.spines.top": False, "axes.spines.right": False,
-    "font.family": "DejaVu Sans", "font.size": 10, "axes.titlesize": 11,
-    "axes.titleweight": "bold", "axes.titlelocation": "left",
-})
-
-
-def D(s):
-    return pd.to_datetime(s, errors="coerce").dt.date
-
-
-# ---------------------------------------------------------------- load
-master = pd.read_csv(DATA / "daily_master.csv", parse_dates=["date"])
-cyc = pd.read_csv(DATA / "whoop" / "physiological_cycles.csv")
-
-ren = {
-    "Recovery score %": "whoop_recovery", "Resting heart rate (bpm)": "whoop_rhr",
-    "Heart rate variability (ms)": "whoop_hrv", "Skin temp (celsius)": "whoop_skintemp",
-    "Day Strain": "whoop_strain", "Sleep performance %": "whoop_sleepperf",
-    "Respiratory rate (rpm)": "whoop_resp", "Asleep duration (min)": "whoop_asleep_min",
-    "Deep (SWS) duration (min)": "whoop_deep_min", "REM duration (min)": "whoop_rem_min",
-    "Sleep debt (min)": "whoop_sleepdebt", "Sleep efficiency %": "whoop_sleepeff",
+RENAME = {
+    "Recovery score %": "recovery", "Resting heart rate (bpm)": "rhr",
+    "Heart rate variability (ms)": "hrv", "Skin temp (celsius)": "skin_temp",
+    "Blood oxygen %": "spo2", "Day Strain": "strain",
+    "Sleep performance %": "sleep_perf", "Respiratory rate (rpm)": "resp_rate",
+    "Asleep duration (min)": "asleep_min", "Deep (SWS) duration (min)": "deep_min",
+    "REM duration (min)": "rem_min", "Sleep debt (min)": "sleep_debt",
+    "Sleep efficiency %": "sleep_eff",
 }
-cyc = cyc.rename(columns=ren)
-wcols = list(ren.values())
-
-# Two keyings of the same WHOOP rows.
-by_start = cyc.assign(date=pd.to_datetime(D(cyc["Cycle start time"])))[["date"] + wcols]
-by_wake = cyc.assign(date=pd.to_datetime(D(cyc["Wake onset"])))[["date"] + wcols]
-# Where two cycles share a date (a nap or a fragmented night creates a second short
-# "sleep" with its own recovery score), keep the main sleep: the longest one.
-def one_per_day(f):
-    f = f.dropna(subset=["whoop_recovery"]).sort_values("whoop_asleep_min", ascending=False)
-    return f.drop_duplicates("date").sort_values("date").reset_index(drop=True)
-
-by_start, by_wake = one_per_day(by_start), one_per_day(by_wake)
-for f in (by_start, by_wake):
-    f["whoop_sleep_h"] = f["whoop_asleep_min"] / 60.0
-
-# Self-logged + behavioural columns (keyed by the morning they were logged).
-selfcols = ["date", "zg_hrv", "zg_sleep_h", "zg_sleepeff", "zg_energy", "zg_soreness",
-            "zg_readiness", "caffeine_mg", "alcohol_g", "water_ml", "srpe", "rpe", "train_min",
-            "weight_kg"]
-selflog = master[[c for c in selfcols if c in master.columns]]
-
-M0 = selflog.merge(by_start, on="date", how="outer").sort_values("date").reset_index(drop=True)  # original keying
-M = selflog.merge(by_wake, on="date", how="outer").sort_values("date").reset_index(drop=True)    # corrected keying
-for f in (M0, M):
-    for c in ["srpe", "train_min"]:
-        f[c] = f[c].fillna(0)
-    # "prior day" means the calendar day before, not the previous row.
-    prev = f[["date", "alcohol_g", "caffeine_mg", "srpe", "whoop_strain", "rpe"]].copy()
-    prev["date"] = prev["date"] + pd.Timedelta(days=1)
-    prev = prev.rename(columns={c: f"prev_{c}" for c in prev.columns if c != "date"})
-    f[prev.columns.drop("date")] = f[["date"]].merge(prev, on="date", how="left").drop(columns="date").values
+TIME_COLS = ["Cycle start time", "Cycle end time", "Sleep onset", "Wake onset"]
+# WHOOP documents these as inputs to the recovery score, so their correlation
+# with the score is partly built in.
+SCORE_INPUTS = ["hrv", "rhr", "resp_rate", "sleep_perf", "skin_temp", "spo2"]
+NIGHT_SLEEP = ["sleep_debt", "deep_min", "rem_min", "sleep_h", "sleep_eff"]
+MORNING_SELF = ["zg_soreness", "zg_energy", "weight_kg"]
+LAGGED_BEHAVIOURS = ["strain", "srpe", "caffeine_mg", "alcohol_g", "water_ml"]
+OLS_FEATURES = ["sleep_h", "sleep_debt", "prev_strain", "prev_caffeine_mg", "prev_alcohol_g"]
+RF_FEATURES = ["sleep_h", "deep_min", "rem_min", "sleep_debt", "prev_strain", "prev_srpe",
+               "prev_caffeine_mg", "prev_alcohol_g", "prev_water_ml", "weight_kg", "zg_soreness"]
+RF_SEEDS, RF_TREES = 25, 200
+NICE = {
+    "recovery": "Recovery %", "hrv": "HRV (ms)", "rhr": "Resting HR (bpm)",
+    "resp_rate": "Respiratory rate", "sleep_perf": "Sleep performance %",
+    "skin_temp": "Skin temp (°C)", "spo2": "Blood oxygen %", "sleep_debt": "Sleep debt (min)",
+    "deep_min": "Deep sleep (min)", "rem_min": "REM (min)", "sleep_h": "Sleep hours",
+    "sleep_eff": "Sleep efficiency %", "zg_soreness": "Soreness (self)",
+    "zg_energy": "Energy (self)", "weight_kg": "Bodyweight (kg)", "strain": "Day strain",
+    "srpe": "Training load (sRPE)", "caffeine_mg": "Caffeine (mg)", "alcohol_g": "Alcohol (g)",
+    "water_ml": "Water (ml)", "prev_strain": "Strain, prior day",
+    "prev_srpe": "Training load, prior day", "prev_caffeine_mg": "Caffeine, prior day",
+    "prev_alcohol_g": "Alcohol, prior day", "prev_water_ml": "Water, prior day",
+}
 
 
-def corr(df, a, b, method="pearson"):
+# ------------------------------------------------------------------ loading
+def load_cycles(path: Path) -> pd.DataFrame:
+    cyc = pd.read_csv(path)
+    for col in TIME_COLS:
+        cyc[col] = pd.to_datetime(cyc[col], errors="coerce")
+    cyc = cyc.rename(columns=RENAME)
+    cyc["sleep_h"] = cyc["asleep_min"] / 60.0
+    return cyc
+
+
+def load_daily_log(path: Path) -> pd.DataFrame:
+    log = pd.read_csv(path, parse_dates=["date"]).set_index("date").sort_index()
+    # A session with no RPE was stored as a training load of zero. That is a
+    # missing value, not a rest day; a rest day has n_sessions == 0.
+    log.loc[(log["n_sessions"] > 0) & (log["srpe"] == 0), "srpe"] = np.nan
+    return log
+
+
+# ---------------------------------------------------------------- alignment
+def scored(cyc: pd.DataFrame) -> pd.DataFrame:
+    return cyc.dropna(subset=["recovery"])
+
+
+def recovery_by_wake_date(cyc: pd.DataFrame) -> pd.DataFrame:
+    """Rules 1 and 3: one row per wake date (the longest scored sleep)."""
+    s = scored(cyc).copy()
+    s["date"] = s["Wake onset"].dt.normalize()
+    s["fragmented"] = s.groupby("date")["date"].transform("size") > 1
+    s = s.sort_values("asleep_min", ascending=False).drop_duplicates("date")
+    return s.set_index("date").sort_index()
+
+
+def recovery_by_cycle_start(cyc: pd.DataFrame) -> pd.DataFrame:
+    """The original, wrong keying. Kept only to show what it did (Section A)."""
+    s = scored(cyc).copy()
+    s["date"] = s["Cycle start time"].dt.normalize()
+    s["unshifted"] = s["date"] == s["Wake onset"].dt.normalize()
+    s = s.sort_values("asleep_min", ascending=False).drop_duplicates("date")
+    return s.set_index("date").sort_index()
+
+
+def strain_by_waking_day(cyc: pd.DataFrame) -> pd.Series:
+    """Rule 2: strain keyed to the date of the cycle midpoint.
+
+    Cycles with no recorded sleep and zero strain are strap-off placeholders
+    (the activation day), not rest days, and are dropped.
+    """
+    c = cyc.dropna(subset=["strain", "Cycle end time"]).copy()
+    placeholder = c["asleep_min"].isna() & (c["strain"] == 0)
+    c = c[~placeholder]
+    mid = c["Cycle start time"] + (c["Cycle end time"] - c["Cycle start time"]) / 2
+    out = pd.Series(c["strain"].to_numpy(), index=pd.DatetimeIndex(mid.dt.normalize()), name="strain")
+    if out.index.has_duplicates:
+        raise ValueError("two cycles map to one waking day; strain needs an explicit rule")
+    return out.sort_index()
+
+
+def prior_day(values: pd.Series) -> pd.Series:
+    """Rule 4: the value logged on the previous calendar day."""
+    out = values.copy()
+    out.index = out.index + pd.Timedelta(days=1)
+    return out
+
+
+def build_frame(recovery_rows: pd.DataFrame, strain: pd.Series, log: pd.DataFrame) -> pd.DataFrame:
+    device = recovery_rows[[c for c in RENAME.values() if c != "strain"] + ["sleep_h"]]
+    extra = [c for c in ("fragmented", "unshifted") if c in recovery_rows]
+    frame = pd.concat([device, recovery_rows[extra], strain, log], axis=1, sort=True)
+    for col in LAGGED_BEHAVIOURS:
+        frame[f"prev_{col}"] = prior_day(frame[col]).reindex(frame.index)
+    return frame
+
+
+# -------------------------------------------------------------------- stats
+def corr(df: pd.DataFrame, a: str, b: str, method: str = "spearman") -> dict:
     s = df[[a, b]].dropna()
     if len(s) < 6:
-        return np.nan, np.nan, len(s)
+        return {"r": None, "p": None, "n": int(len(s))}
     f = stats.pearsonr if method == "pearson" else stats.spearmanr
     r, p = f(s[a], s[b])
-    return float(r), float(p), int(len(s))
+    return {"r": float(r), "p": float(p), "n": int(len(s))}
 
 
-R = {"n_whoop_days": int(M.whoop_recovery.notna().sum()),
-     "n_overlap_wake": int((M.whoop_recovery.notna() & M.zg_readiness.notna()).sum()),
-     "n_overlap_start": int((M0.whoop_recovery.notna() & M0.zg_readiness.notna()).sum())}
+def boot_ci(df: pd.DataFrame, a: str, b: str, n_boot: int = 2000, seed: int = 0) -> list[float]:
+    """Percentile bootstrap for Spearman's rho. Days are resampled as if
+    independent, which they are not, so read the interval as a lower bound on
+    the uncertainty."""
+    s = df[[a, b]].dropna().to_numpy(dtype=float)
+    rng = np.random.default_rng(seed)
+    rhos = []
+    for _ in range(n_boot):
+        t = s[rng.integers(0, len(s), len(s))]
+        if len(np.unique(t[:, 0])) > 2 and len(np.unique(t[:, 1])) > 2:
+            rhos.append(np.corrcoef(stats.rankdata(t[:, 0]), stats.rankdata(t[:, 1]))[0, 1])
+    lo, hi = np.percentile(rhos, [2.5, 97.5])
+    return [float(lo), float(hi)]
 
-# ---------------------------------------------------------------- A) alignment
-A = {}
-for label, df in (("cycle_start", M0), ("wake_onset", M)):
-    A[label] = {
-        "hrv_self_vs_device": corr(df, "zg_hrv", "whoop_hrv"),
-        "readiness_vs_recovery": corr(df, "zg_readiness", "whoop_recovery"),
-        "sleep_self_vs_device": corr(df, "zg_sleep_h", "whoop_sleep_h"),
+
+def ols(df: pd.DataFrame, y: str, features: list[str], standardize: bool = True) -> dict:
+    """Ordinary least squares with 95% intervals; predictors in SD units."""
+    sub = df[[y] + features].dropna().astype(float)
+    X = sub[features]
+    if standardize:
+        X = (X - X.mean()) / X.std()
+    A = np.column_stack([np.ones(len(sub)), X.to_numpy()])
+    yv = sub[y].to_numpy()
+    beta = np.linalg.solve(A.T @ A, A.T @ yv)
+    resid = yv - A @ beta
+    dof = len(sub) - A.shape[1]
+    se = np.sqrt(np.diag(resid @ resid / dof * np.linalg.inv(A.T @ A)))
+    half = stats.t.ppf(0.975, dof) * se
+    pvals = 2 * stats.t.sf(np.abs(beta / se), dof)
+    r2 = 1 - resid @ resid / ((yv - yv.mean()) @ (yv - yv.mean()))
+    return {"n": int(len(sub)), "r2": float(r2),
+            "adj_r2": float(1 - (1 - r2) * (len(sub) - 1) / dof),
+            "beta": {f: {"b": float(beta[i + 1]), "lo": float(beta[i + 1] - half[i + 1]),
+                         "hi": float(beta[i + 1] + half[i + 1]), "p": float(pvals[i + 1])}
+                     for i, f in enumerate(features)}}
+
+
+def analyse(M0: pd.DataFrame, M: pd.DataFrame, cyc: pd.DataFrame) -> dict:
+    R: dict = {}
+    sc = scored(cyc)
+    shifted = sc["Cycle start time"].dt.normalize() != sc["Wake onset"].dt.normalize()
+    fragmented = M["fragmented"].fillna(False).astype(bool)
+    both = M[["zg_hrv", "hrv"]].dropna()
+    R["counts"] = {
+        "cycles": int(len(cyc)), "scored_cycles": int(len(sc)),
+        "wake_dates": int(M["recovery"].notna().sum()),
+        "fragmented_mornings": [d.strftime("%Y-%m-%d") for d in M.index[fragmented]],
+        "moved_earlier_by_cycle_start_key": int(shifted.sum()),
+        "left_in_place_by_cycle_start_key": int((~shifted).sum()),
+        "overlap_wake": int((M["recovery"].notna() & M["zg_readiness"].notna()).sum()),
+        "overlap_start": int((M0["recovery"].notna() & M0["zg_readiness"].notna()).sum()),
+        "alcohol_days_in_log": int((M["alcohol_g"] > 0).sum()),
+        "alcohol_days_in_whoop_window": int(((M["alcohol_g"] > 0) & M["recovery"].notna()).sum()),
+        "self_hrv_identical_days": int((both["zg_hrv"] == both["hrv"]).sum()),
+        "self_hrv_compared_days": int(len(both)),
+        "self_hrv_max_abs_diff_ms": float((both["zg_hrv"] - both["hrv"]).abs().max()),
     }
-R["alignment"] = A
-
-# ---------------------------------------------------------------- B) same-day drivers of recovery
-drivers = ["whoop_deep_min", "whoop_sleepperf", "whoop_sleepdebt", "whoop_sleep_h", "whoop_rem_min",
-           "whoop_strain", "whoop_skintemp", "whoop_resp", "caffeine_mg", "alcohol_g", "water_ml",
-           "srpe", "weight_kg", "zg_energy", "zg_soreness"]
-B = {d: corr(M, d, "whoop_recovery", "spearman") for d in drivers if d in M}
-R["same_day_spearman"] = B
-R["skin_vs_hrv"] = corr(M, "whoop_skintemp", "whoop_hrv")
-R["weight_vs_recovery"] = corr(M, "weight_kg", "whoop_recovery")
-
-# ---------------------------------------------------------------- C) lagged
-C = {c: corr(M, f"prev_{c}", "whoop_recovery", "spearman") for c in ["whoop_strain", "srpe", "alcohol_g", "caffeine_mg"]}
-C["same_day_strain"] = corr(M, "whoop_strain", "whoop_recovery", "spearman")
-R["lagged_spearman"] = C
-
-# ---------------------------------------------------------------- D) OLS (standardized)
-feat = ["whoop_sleep_h", "prev_alcohol_g", "prev_whoop_strain", "caffeine_mg", "whoop_sleepdebt"]
-sub = M[["whoop_recovery"] + feat].dropna()
-X = (sub[feat] - sub[feat].mean()) / sub[feat].std()
-lr = LinearRegression().fit(X, sub["whoop_recovery"])
-R["ols"] = {"n": int(len(sub)), "r2": float(lr.score(X, sub["whoop_recovery"])),
-            "beta_per_sd": {k: float(v) for k, v in zip(feat, lr.coef_)}}
-
-# ---------------------------------------------------------------- E) random-forest importance
-rf_feat = ["whoop_sleep_h", "whoop_deep_min", "whoop_rem_min", "whoop_sleepdebt", "whoop_resp",
-           "whoop_skintemp", "caffeine_mg", "alcohol_g", "water_ml", "srpe", "prev_alcohol_g",
-           "prev_whoop_strain", "prev_srpe", "weight_kg", "zg_soreness"]
-sub = M[["whoop_recovery"] + rf_feat].dropna()
-rf = RandomForestRegressor(n_estimators=400, random_state=0, min_samples_leaf=2).fit(sub[rf_feat], sub["whoop_recovery"])
-imp = sorted(zip(rf_feat, rf.feature_importances_), key=lambda x: -x[1])
-R["rf"] = {"n": int(len(sub)), "importance": {k: float(v) for k, v in imp}}
-
-# ---------------------------------------------------------------- figures
-NICE = {"whoop_deep_min": "Deep sleep (min)", "whoop_sleepperf": "Sleep performance %",
-        "whoop_sleepdebt": "Sleep debt (min)", "whoop_sleep_h": "Sleep hours", "whoop_rem_min": "REM (min)",
-        "whoop_strain": "Day strain", "whoop_skintemp": "Skin temp (°C)", "whoop_resp": "Respiratory rate",
-        "caffeine_mg": "Caffeine (mg)", "alcohol_g": "Alcohol (g)", "water_ml": "Water (ml)",
-        "srpe": "Training load (sRPE)", "weight_kg": "Bodyweight (kg)", "zg_energy": "Energy (self)",
-        "zg_soreness": "Soreness (self)", "prev_alcohol_g": "Alcohol, prior day",
-        "prev_whoop_strain": "Strain, prior day", "prev_srpe": "Training load, prior day"}
+    # A) alignment: self-logged vs device under both keyings
+    R["alignment"] = {
+        label: {"hrv_self_vs_device": corr(df, "zg_hrv", "hrv", "pearson"),
+                "sleep_self_vs_device": corr(df, "zg_sleep_h", "sleep_h", "pearson"),
+                "readiness_vs_recovery": corr(df, "zg_readiness", "recovery", "pearson")}
+        for label, df in (("cycle_start", M0), ("wake_onset", M))}
+    # B) same-morning correlates of the score, grouped by what they are
+    R["same_morning"] = {
+        "score_inputs": {c: corr(M, c, "recovery") for c in SCORE_INPUTS},
+        "night_sleep": {c: corr(M, c, "recovery") for c in NIGHT_SLEEP},
+        "morning_self_report": {c: corr(M, c, "recovery") for c in MORNING_SELF},
+    }
+    R["inputs_explain_score"] = ols(M, "recovery", ["hrv", "rhr", "resp_rate", "sleep_perf"], standardize=False)
+    R["skin_vs_hrv"] = corr(M, "skin_temp", "hrv", "pearson")
+    # C) prior-day strain and training load, against the raw signals and the score
+    steady = M[~fragmented]
+    lag = {}
+    for target in ("hrv", "rhr", "recovery"):
+        lag[target] = {
+            "prior_day_strain": {**corr(M, "prev_strain", target), "ci": boot_ci(M, "prev_strain", target)},
+            "prior_day_strain_no_fragmented": {**corr(steady, "prev_strain", target),
+                                               "ci": boot_ci(steady, "prev_strain", target)},
+            "same_day_strain": corr(M, "strain", target),
+            "prior_day_srpe": corr(M, "prev_srpe", target),
+        }
+    lag["recovery"]["prior_day_caffeine"] = corr(M, "prev_caffeine_mg", "recovery")
+    lag["recovery"]["prior_day_alcohol"] = corr(M, "prev_alcohol_g", "recovery")
+    R["lagged"] = lag
+    # D) regression on predictors that precede the score
+    R["ols"] = ols(M, "recovery", OLS_FEATURES)
+    # E) random forest on the same principle, repeated over seeds
+    R["rf"] = forest_importance(M)
+    return R
 
 
-def style_axes(ax):
-    ax.set_axisbelow(True)
-    ax.tick_params(length=0)
+def forest_importance(M: pd.DataFrame, seeds: int = RF_SEEDS) -> dict:
+    """Impurity importance averaged over seeds, plus how often each feature
+    ranks first. With about 20 rows a single seed's ordering means little."""
+    sub = M[["recovery"] + RF_FEATURES].dropna()
+    imps = np.zeros((seeds, len(RF_FEATURES)))
+    for seed in range(seeds):
+        rf = RandomForestRegressor(n_estimators=RF_TREES, random_state=seed, min_samples_leaf=2)
+        imps[seed] = rf.fit(sub[RF_FEATURES], sub["recovery"]).feature_importances_
+    first = np.bincount(imps.argmax(axis=1), minlength=len(RF_FEATURES)) / seeds
+    order = np.argsort(-imps.mean(axis=0))
+    return {"n": int(len(sub)), "seeds": seeds, "trees": RF_TREES,
+            "importance": {RF_FEATURES[i]: float(imps[:, i].mean()) for i in order},
+            "ranked_first_share": {RF_FEATURES[i]: float(first[i]) for i in order if first[i] > 0}}
 
 
-def scatter(ax, x, y, color=BLUE):
-    ax.scatter(x, y, s=42, color=color, edgecolor=SURFACE, linewidth=1.5, zorder=3)
+# ------------------------------------------------------------------ figures
+BLUE, ORANGE = "#2a78d6", "#eb6834"
+INK, MUTED, GRID, SURFACE = "#0b0b0b", "#52514e", "#e6e4df", "#fcfcfb"
 
 
-def fitline(ax, x, y, color=BLUE):
-    s = pd.concat([x, y], axis=1).dropna()
+def set_style() -> None:
+    plt.rcParams.update({
+        "figure.facecolor": SURFACE, "axes.facecolor": SURFACE, "axes.edgecolor": GRID,
+        "axes.labelcolor": INK, "xtick.color": MUTED, "ytick.color": MUTED,
+        "axes.grid": True, "grid.color": GRID, "grid.linewidth": 0.8,
+        "axes.spines.top": False, "axes.spines.right": False,
+        "font.family": "DejaVu Sans", "font.size": 10, "axes.titlesize": 11,
+        "axes.titleweight": "bold", "axes.titlelocation": "left",
+        "legend.frameon": False, "legend.fontsize": 8.5,
+    })
+
+
+def fmt_p(p: float) -> str:
+    return "p < 0.001" if p < 0.001 else f"p = {p:.3f}"
+
+
+def fmt(c: dict, sym: str = "ρ") -> str:
+    if c["r"] is None:
+        return f"n = {c['n']} (too few)"
+    return f"{sym} = {c['r']:+.2f}, {fmt_p(c['p'])}, n = {c['n']}"
+
+
+def scatter(ax, x, y, color=BLUE, hollow=False, label=None):
+    face = SURFACE if hollow else color
+    edge = color if hollow else SURFACE
+    ax.scatter(x, y, s=26 if hollow else 42, facecolor=face, edgecolor=edge, linewidth=1.6, zorder=3, label=label)
+
+
+def fitline(ax, x, y, color=BLUE, style="-"):
+    s = pd.concat([x, y], axis=1).dropna().astype(float)
     if len(s) >= 3:
         m, b = np.polyfit(s.iloc[:, 0], s.iloc[:, 1], 1)
         xs = np.linspace(s.iloc[:, 0].min(), s.iloc[:, 0].max(), 50)
-        ax.plot(xs, m * xs + b, color=color, linewidth=2, zorder=2)
+        ax.plot(xs, m * xs + b, color=color, linewidth=2, linestyle=style, zorder=2)
 
 
-# Fig 1 — importance
-top = imp[:8]
-fig, ax = plt.subplots(figsize=(7.2, 3.6), dpi=200)
-names = [NICE.get(k, k) for k, _ in top][::-1]
-vals = [v for _, v in top][::-1]
-bars = ax.barh(names, vals, color=[BLUE if i == len(vals) - 1 else "#b9cfee" for i in range(len(vals))], height=0.62)
-for b, v in zip(bars, vals):
-    ax.text(v + 0.006, b.get_y() + b.get_height() / 2, f"{v:.2f}", va="center", color=MUTED, fontsize=9)
-ax.set_xlim(0, max(vals) * 1.18)
-ax.set_xlabel("Random-forest impurity importance (sums to 1 across all 15 features)")
-ax.set_title(f"What predicted my recovery score  ·  {R['rf']['n']} days, 400 trees")
-ax.grid(axis="y", visible=False)
-style_axes(ax)
-fig.tight_layout(); fig.savefig(FIG / "fig1_importance.png"); plt.close(fig)
-
-# Fig 2 — sleep architecture vs recovery (two panels, one series)
-fig, axes = plt.subplots(1, 2, figsize=(7.2, 3.3), dpi=200, sharey=True)
-for ax, col, lab in zip(axes, ["whoop_sleepdebt", "whoop_sleepperf"], ["Sleep debt (min)", "Sleep performance %"]):
-    s = M[[col, "whoop_recovery"]].dropna()
-    scatter(ax, s[col], s["whoop_recovery"]); fitline(ax, s[col], s["whoop_recovery"])
-    r, p, n = corr(M, col, "whoop_recovery", "spearman")
-    ax.set_title(f"{lab}\nρ = {r:+.2f}, p = {p:.3f}, n = {n}")
-    ax.set_xlabel(lab); style_axes(ax)
-axes[0].set_ylabel("WHOOP recovery %")
-fig.suptitle("Sleep debt and sleep performance vs. recovery", x=0.02, ha="left", fontweight="bold", fontsize=11)
-fig.tight_layout(); fig.savefig(FIG / "fig2_sleep_vs_recovery.png"); plt.close(fig)
-
-# Fig 3 — same-day vs prior-day strain
-fig, axes = plt.subplots(1, 2, figsize=(7.2, 3.3), dpi=200, sharey=True)
-for ax, col, lab in zip(axes, ["whoop_strain", "prev_whoop_strain"], ["Same-day strain", "Prior-day strain"]):
-    s = M[[col, "whoop_recovery"]].dropna()
-    scatter(ax, s[col], s["whoop_recovery"]); fitline(ax, s[col], s["whoop_recovery"])
-    r, p, n = corr(M, col, "whoop_recovery", "spearman")
-    ax.set_title(f"{lab}\nρ = {r:+.2f}, p = {p:.3f}, n = {n}")
-    ax.set_xlabel("WHOOP day strain"); style_axes(ax)
-axes[0].set_ylabel("WHOOP recovery %")
-fig.suptitle("Training fatigue shows up a day late", x=0.02, ha="left", fontweight="bold", fontsize=11)
-fig.tight_layout(); fig.savefig(FIG / "fig3_strain_lag.png"); plt.close(fig)
-
-# Fig 4 — skin temp vs HRV
-fig, ax = plt.subplots(figsize=(5.2, 3.4), dpi=200)
-s = M[["whoop_skintemp", "whoop_hrv"]].dropna()
-scatter(ax, s["whoop_skintemp"], s["whoop_hrv"]); fitline(ax, s["whoop_skintemp"], s["whoop_hrv"])
-r, p, n = R["skin_vs_hrv"]
-ax.set_title(f"Skin temperature vs. HRV\nr = {r:+.2f}, p = {p:.3f}, n = {n}")
-ax.set_xlabel("Skin temperature during sleep (°C)"); ax.set_ylabel("HRV (ms)"); style_axes(ax)
-fig.tight_layout(); fig.savefig(FIG / "fig4_skintemp_hrv.png"); plt.close(fig)
-
-# Fig 5 — the alignment bug: self-logged HRV vs device HRV under both keyings
-fig, axes = plt.subplots(1, 2, figsize=(7.2, 3.3), dpi=200, sharey=True)
-for ax, (label, df, color) in zip(axes, (("Keyed to cycle start (wrong)", M0, ORANGE), ("Keyed to wake onset (right)", M, BLUE))):
-    s = df[["zg_hrv", "whoop_hrv"]].dropna()
-    scatter(ax, s["whoop_hrv"], s["zg_hrv"], color); fitline(ax, s["whoop_hrv"], s["zg_hrv"], color)
-    r, p, n = corr(df, "zg_hrv", "whoop_hrv")
-    ax.set_title(f"{label}\nr = {r:+.2f}, p = {p:.3f}, n = {n}")
-    ax.set_xlabel("WHOOP HRV (ms)"); style_axes(ax)
-axes[0].set_ylabel("HRV I logged in the app (ms)")
-fig.suptitle("One join key, two conclusions", x=0.02, ha="left", fontweight="bold", fontsize=11)
-fig.tight_layout(); fig.savefig(FIG / "fig5_alignment_bug.png"); plt.close(fig)
-
-# ---------------------------------------------------------------- results.md
-def fmt(t):
-    r, p, n = t
-    return f"r = {r:+.2f}, p = {p:.3f}, n = {n}"
+def finish(fig, ax_list, title, name, rect=(0, 0, 1, 1)):
+    for ax in ax_list:
+        ax.set_axisbelow(True)
+        ax.tick_params(length=0)
+    fig.suptitle(title, x=0.02, ha="left", fontweight="bold", fontsize=11)
+    fig.tight_layout(rect=rect)
+    fig.savefig(FIG / name)
+    plt.close(fig)
 
 
-lines = ["# Results (regenerated by analyze.py)", "",
-         f"WHOOP days: {R['n_whoop_days']} · overlap with self-logs (wake-onset keyed): {R['n_overlap_wake']} · (cycle-start keyed): {R['n_overlap_start']}", "",
-         "## A. Alignment check — self-logged vs device", "",
+def two_panel(M, cols, labels, y, ylabel, title, name, xlabel=None):
+    fig, axes = plt.subplots(1, 2, figsize=(7.2, 3.3), dpi=200, sharey=True)
+    for ax, col, lab in zip(axes, cols, labels):
+        s = M[[col, y]].dropna()
+        scatter(ax, s[col], s[y])
+        fitline(ax, s[col], s[y])
+        ax.set_title(f"{lab}\n{fmt(corr(M, col, y))}")
+        ax.set_xlabel(xlabel or lab)
+    axes[0].set_ylabel(ylabel)
+    finish(fig, axes, title, name)
+
+
+def make_figures(M0: pd.DataFrame, M: pd.DataFrame, R: dict) -> None:
+    FIG.mkdir(exist_ok=True)
+    set_style()
+
+    # Fig 1: random-forest importance
+    top = list(R["rf"]["importance"].items())[:8][::-1]
+    fig, ax = plt.subplots(figsize=(7.2, 3.6), dpi=200)
+    best = top[-1][1]
+    colors = [BLUE if best - v < 0.01 else "#b9cfee" for _, v in top]  # a tie is drawn as a tie
+    bars = ax.barh([NICE[k] for k, _ in top], [v for _, v in top], color=colors, height=0.62)
+    for b, (_, v) in zip(bars, top):
+        ax.text(v + 0.006, b.get_y() + b.get_height() / 2, f"{v:.2f}", va="center", color=MUTED, fontsize=9)
+    ax.set_xlim(0, top[-1][1] * 1.18)
+    ax.set_xlabel(f"Random-forest impurity importance (sums to 1 across all {len(RF_FEATURES)} features)")
+    ax.grid(axis="y", visible=False)
+    finish(fig, [ax], f"What came before my recovery score  ·  {R['rf']['n']} days, mean of {R['rf']['seeds']} forests",
+           "fig1_importance.png")
+
+    # Fig 2: sleep debt and sleep performance vs recovery
+    two_panel(M, ["sleep_debt", "sleep_perf"], ["Sleep debt (min)", "Sleep performance % (a score input)"],
+              "recovery", "WHOOP recovery %", "Sleep debt and sleep performance vs. recovery",
+              "fig2_sleep_vs_recovery.png")
+
+    # Fig 3: same-day vs prior-day strain, against the raw signal
+    two_panel(M, ["strain", "prev_strain"], ["Same-day strain", "Prior-day strain"], "hrv",
+              "Morning HRV (ms)", "Training fatigue shows up a day late, in the raw signal",
+              "fig3_strain_lag.png", xlabel="WHOOP day strain")
+
+    # Fig 4: skin temperature vs HRV
+    fig, ax = plt.subplots(figsize=(5.2, 3.4), dpi=200)
+    s = M[["skin_temp", "hrv"]].dropna()
+    scatter(ax, s["skin_temp"], s["hrv"])
+    fitline(ax, s["skin_temp"], s["hrv"])
+    ax.set_title(fmt(R["skin_vs_hrv"], "r"))
+    ax.set_xlabel("Skin temperature during sleep (°C)")
+    ax.set_ylabel("HRV (ms)")
+    finish(fig, [ax], "Skin temperature vs. HRV", "fig4_skintemp_hrv.png")
+
+    # Fig 5: the alignment bug
+    fig, axes = plt.subplots(1, 2, figsize=(7.2, 3.55), dpi=200, sharey=True)
+    s = M0[["zg_hrv", "hrv", "unshifted"]].dropna()
+    stayed_mask = s["unshifted"].astype(bool)
+    moved, stayed = s[~stayed_mask], s[stayed_mask]
+    scatter(axes[0], moved["hrv"], moved["zg_hrv"], ORANGE, label="key landed on an earlier date")
+    scatter(axes[0], stayed["hrv"], stayed["zg_hrv"], ORANGE, hollow=True, label="cycle began after midnight: key landed on the right date")
+    fitline(axes[0], s["hrv"], s["zg_hrv"], ORANGE)
+    axes[0].set_title(f"Keyed to cycle start (wrong)\n{fmt(R['alignment']['cycle_start']['hrv_self_vs_device'], 'r')}")
+    s = M[["zg_hrv", "hrv"]].dropna()
+    scatter(axes[1], s["hrv"], s["zg_hrv"])
+    fitline(axes[1], s["hrv"], s["zg_hrv"])
+    axes[1].set_title(f"Keyed to wake onset (right)\n{fmt(R['alignment']['wake_onset']['hrv_self_vs_device'], 'r')}")
+    for ax in axes:
+        ax.set_xlabel("WHOOP HRV (ms)")
+    axes[0].set_ylabel("HRV I logged in the app (ms)")
+    fig.legend(*axes[0].get_legend_handles_labels(), loc="lower left", bbox_to_anchor=(0.06, 0.0), ncol=2,
+               handletextpad=0.2, columnspacing=1.2)
+    finish(fig, axes, "One join key, two conclusions", "fig5_alignment_bug.png", rect=(0, 0.07, 1, 1))
+
+    # Fig 6: the same lag against the composite score, fragmented mornings marked
+    fig, ax = plt.subplots(figsize=(5.6, 3.85), dpi=200)
+    s = M[["prev_strain", "recovery", "fragmented"]].dropna()
+    frag = s["fragmented"].astype(bool)
+    scatter(ax, s.loc[~frag, "prev_strain"], s.loc[~frag, "recovery"], label="ordinary mornings")
+    scatter(ax, s.loc[frag, "prev_strain"], s.loc[frag, "recovery"], ORANGE, label="after a fragmented night")
+    fitline(ax, s.loc[~frag, "prev_strain"], s.loc[~frag, "recovery"])
+    fitline(ax, s["prev_strain"], s["recovery"], ORANGE, style="--")
+    lag = R["lagged"]["recovery"]
+    ax.set_title(f"without them: {fmt(lag['prior_day_strain_no_fragmented'])}\n"
+                 f"all mornings:  {fmt(lag['prior_day_strain'])}", fontsize=9.5)
+    ax.set_xlabel("Prior-day WHOOP strain")
+    ax.set_ylabel("WHOOP recovery %")
+    fig.legend(*ax.get_legend_handles_labels(), loc="lower left", bbox_to_anchor=(0.1, 0.0), ncol=2,
+               handletextpad=0.2, columnspacing=1.2)
+    finish(fig, [ax], "Two mornings decide how strong the score version looks", "fig6_score_vs_signal.png",
+           rect=(0, 0.07, 1, 1))
+
+
+# ------------------------------------------------------------------ results
+def table(rows: list[tuple[str, dict]], sym: str = "ρ") -> list[str]:
+    out = [f"| Variable | {sym} | p | n |", "|---|---|---|---|"]
+    for name, c in rows:
+        if c["r"] is None:
+            out.append(f"| {name} | n/a | n/a | {c['n']} |")
+        else:
+            p = "< 0.001" if c["p"] < 0.001 else f"{c['p']:.3f}"
+            out.append(f"| {name} | {c['r']:+.2f} | {p} | {c['n']} |")
+    return out
+
+
+def by_strength(block: dict) -> list[tuple[str, dict]]:
+    return sorted(((NICE[k], v) for k, v in block.items()), key=lambda kv: -abs(kv[1]["r"] or 0))
+
+
+def results_markdown(R: dict) -> str:
+    n, A, lag = R["counts"], R["alignment"], R["lagged"]
+    L = ["# Results (regenerated by analyze.py)", "",
+         f"Cycles in the export: {n['cycles']} · with a recovery score: {n['scored_cycles']} · "
+         f"distinct wake dates: {n['wake_dates']} · overlap with the daily log: {n['overlap_wake']} "
+         f"(cycle-start keyed: {n['overlap_start']})", "",
+         f"Fragmented mornings (more than one scored sleep): {', '.join(n['fragmented_mornings'])}", "",
+         "## A. Alignment check: self-logged vs device", "",
+         f"The cycle-start key put {n['moved_earlier_by_cycle_start_key']} of {n['scored_cycles']} scored cycles on an "
+         f"earlier date than the morning they describe and left {n['left_in_place_by_cycle_start_key']} in place "
+         "(the cycle began after midnight).", "",
          "| Pair | Cycle-start keyed | Wake-onset keyed |", "|---|---|---|"]
-for k, lab in [("hrv_self_vs_device", "HRV, self-logged vs WHOOP"), ("readiness_vs_recovery", "Readiness (self) vs WHOOP recovery"), ("sleep_self_vs_device", "Sleep hours, self vs WHOOP")]:
-    lines.append(f"| {lab} | {fmt(A['cycle_start'][k])} | {fmt(A['wake_onset'][k])} |")
-lines += ["", "## B. Same-day correlates of WHOOP recovery (Spearman, wake-onset keyed)", "", "| Variable | ρ | p | n |", "|---|---|---|---|"]
-for k, (r, p, n) in sorted(B.items(), key=lambda kv: -abs(kv[1][0]) if kv[1][0] == kv[1][0] else 0):
-    lines.append(f"| {NICE.get(k, k)} | {r:+.2f} | {p:.3f} | {n} |")
-lines += ["", f"Skin temp vs HRV (Pearson): {fmt(R['skin_vs_hrv'])}", f"Bodyweight vs recovery (Pearson): {fmt(R['weight_vs_recovery'])}", "",
-          "## C. Prior-day vs same-day (Spearman)", "", "| Variable | ρ | p | n |", "|---|---|---|---|"]
-for k, (r, p, n) in C.items():
-    lines.append(f"| {k} | {r:+.2f} | {p:.3f} | {n} |")
-lines += ["", f"## D. Standardized OLS, recovery ~ features (n = {R['ols']['n']}, R² = {R['ols']['r2']:.2f})", "", "| Feature | β (recovery pts per SD) |", "|---|---|"]
-for k, v in sorted(R["ols"]["beta_per_sd"].items(), key=lambda kv: -abs(kv[1])):
-    lines.append(f"| {NICE.get(k, k)} | {v:+.1f} |")
-lines += ["", f"## E. Random-forest importance (n = {R['rf']['n']})", "", "| Feature | importance |", "|---|---|"]
-for k, v in imp:
-    lines.append(f"| {NICE.get(k, k)} | {v:.3f} |")
-(HERE / "results.md").write_text("\n".join(lines) + "\n", encoding="utf-8")
-(HERE / "results.json").write_text(json.dumps(R, indent=2), encoding="utf-8")
-print("\n".join(lines))
+    for key, name in (("hrv_self_vs_device", "HRV, self-logged vs WHOOP"),
+                      ("sleep_self_vs_device", "Sleep hours, self vs WHOOP"),
+                      ("readiness_vs_recovery", "Readiness (self) vs WHOOP recovery")):
+        L.append(f"| {name} | {fmt(A['cycle_start'][key], 'r')} | {fmt(A['wake_onset'][key], 'r')} |")
+    L += ["", f"Self-logged HRV equals the device value on {n['self_hrv_identical_days']} of "
+              f"{n['self_hrv_compared_days']} days; the largest difference is {n['self_hrv_max_abs_diff_ms']:.0f} ms.", "",
+          "## B. Same-morning correlates of WHOOP recovery (Spearman, wake-onset keyed)", "",
+          "### B1. Documented inputs to the score (correlation is partly built in)", ""]
+    L += table(by_strength(R["same_morning"]["score_inputs"]))
+    ie = R["inputs_explain_score"]
+    L += ["", f"Recovery regressed on HRV, RHR, respiratory rate and sleep performance: R² = {ie['r2']:.2f} (n = {ie['n']}).", "",
+          "### B2. Other measures of the night's sleep", ""]
+    L += table(by_strength(R["same_morning"]["night_sleep"]))
+    L += ["", "### B3. Morning self-reports", ""]
+    L += table(by_strength(R["same_morning"]["morning_self_report"]))
+    L += ["", f"Skin temp vs HRV (Pearson): {fmt(R['skin_vs_hrv'], 'r')}", "",
+          "## C. Prior-day strain and training load (Spearman; strain keyed to the waking day)", "",
+          "| Outcome | Prior-day strain, all mornings | 95% bootstrap CI | Without fragmented mornings | 95% bootstrap CI | Same-day strain | Prior-day sRPE |",
+          "|---|---|---|---|---|---|---|"]
+    for target in ("hrv", "rhr", "recovery"):
+        t = lag[target]
+        L.append(f"| {NICE[target]} | {fmt(t['prior_day_strain'])} | [{t['prior_day_strain']['ci'][0]:+.2f}, {t['prior_day_strain']['ci'][1]:+.2f}] "
+                 f"| {fmt(t['prior_day_strain_no_fragmented'])} | [{t['prior_day_strain_no_fragmented']['ci'][0]:+.2f}, "
+                 f"{t['prior_day_strain_no_fragmented']['ci'][1]:+.2f}] | {fmt(t['same_day_strain'])} | {fmt(t['prior_day_srpe'])} |")
+    L += ["", f"Prior-day caffeine vs recovery: {fmt(lag['recovery']['prior_day_caffeine'])}",
+          f"Prior-day alcohol vs recovery: {fmt(lag['recovery']['prior_day_alcohol'])} "
+          f"({n['alcohol_days_in_whoop_window']} alcohol days inside the WHOOP window)", "",
+          f"## D. Standardized OLS, recovery ~ predictors that precede the score "
+          f"(n = {R['ols']['n']}, R² = {R['ols']['r2']:.2f}, adjusted R² = {R['ols']['adj_r2']:.2f})", "",
+          "| Feature | β (recovery pts per SD) | 95% CI | p |", "|---|---|---|---|"]
+    for k, b in sorted(R["ols"]["beta"].items(), key=lambda kv: -abs(kv[1]["b"])):
+        L.append(f"| {NICE[k]} | {b['b']:+.1f} | [{b['lo']:+.1f}, {b['hi']:+.1f}] | {b['p']:.3f} |")
+    rf = R["rf"]
+    L += ["", f"## E. Random-forest importance (n = {rf['n']}; mean of {rf['seeds']} seeds, {rf['trees']} trees each; "
+              "nothing measured after the score)", "",
+          "| Feature | mean importance | ranked first in |", "|---|---|---|"]
+    L += [f"| {NICE[k]} | {v:.3f} | {rf['ranked_first_share'].get(k, 0):.0%} of seeds |" for k, v in rf["importance"].items()]
+    return "\n".join(L) + "\n"
+
+
+def rounded(obj, places: int = 6):
+    if isinstance(obj, float):
+        return round(obj, places)
+    if isinstance(obj, dict):
+        return {k: rounded(v, places) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [rounded(v, places) for v in obj]
+    return obj
+
+
+def main() -> None:
+    cyc = load_cycles(DATA / "whoop" / "physiological_cycles.csv")
+    log = load_daily_log(DATA / "daily_master.csv")
+    strain = strain_by_waking_day(cyc)
+    M0 = build_frame(recovery_by_cycle_start(cyc), strain, log)
+    M = build_frame(recovery_by_wake_date(cyc), strain, log)
+    R = analyse(M0, M, cyc)
+    make_figures(M0, M, R)
+    text = results_markdown(R)
+    # newline="\n" keeps the outputs byte-identical across operating systems
+    (HERE / "results.md").write_text(text, encoding="utf-8", newline="\n")
+    (HERE / "results.json").write_text(json.dumps(rounded(R), indent=2) + "\n", encoding="utf-8", newline="\n")
+    print(text)
+
+
+if __name__ == "__main__":
+    main()
