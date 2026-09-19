@@ -1,18 +1,61 @@
 # whoop-n-of-1
 
-One person, one month of WHOOP data, and the join bug that changed the findings.
+**One person, one month of WHOOP data, and the join bug that changed the findings.**
+
+![Python 3.11+](https://img.shields.io/badge/python-3.11%2B-3776AB?logo=python&logoColor=white)
+![Code license: MIT](https://img.shields.io/badge/code%20license-MIT-2ea44f)
+![n = 1](https://img.shields.io/badge/n-1-lightgrey)
+
+**[Read the article](ARTICLE.md)** · [Results tables](results.md) · [Run it](#run-it) · [Honest limits](#honest-limits)
+
+![One join key, two conclusions](figures/fig5_alignment_bug.png)
+
+The same two HRV columns, joined two ways. Keyed to cycle start, my self-logged HRV and WHOOP's HRV correlate at r = +0.04. Keyed to wake onset, r = +1.00. A WHOOP cycle's recovery, HRV, RHR, and sleep fields describe the morning you woke up, not the night the cycle started, so my first join labeled every record a day early. Fixing that one line made about half of my original findings evaporate.
 
 This repository reproduces every number and figure in the article
 [*What a month of my WHOOP data actually predicted (and the bug that changed the answer)*](ARTICLE.md).
 It exists so the analysis can be checked, not just read.
 
+## Findings at a glance
+
+| Claim | First pass (June, misaligned) | After the fix | Verdict |
+|---|---|---|---|
+| Yesterday's strain lowers today's recovery | — | ρ = −0.59 (p = 0.002, n = 24); same-day ρ = +0.05 | **Survived**, and got stronger |
+| Sleep debt hurts, sleep performance helps, raw hours don't | — | debt ρ = −0.42 (p = 0.03); performance ρ = +0.38 (p = 0.05); hours ρ = −0.02 | **Survived** |
+| Deep sleep is the top recovery predictor | RF importance 0.35, ranked first | 0.13, ranked fifth; ρ = +0.18 (p = 0.38) | Did not survive |
+| Skin temperature tracks HRV | r = −0.50 (p = 0.02) | r = −0.26 (p = 0.20, n = 27) | Weakened |
+| Alcohol and caffeine cost recovery points | −7 and −5 points per SD | +2 and +10 points per SD (both signs flipped) | Not usable |
+| My self-logged HRV barely tracks the device | r = +0.04 (n = 17) | r = +1.00 (n = 22); the "self-log" was a transcription of the device | The bug itself |
+| My self-report readiness score tracks WHOOP recovery | — | r = −0.06 (n = 22) | Did not hold |
+| Respiratory rate rises with recovery | — | ρ = +0.52 (p = 0.005) | Unexplained; about what chance hands you across 15 tests |
+
+Full tables are in [`results.md`](results.md); the reasoning is in the [article](ARTICLE.md).
+
+![Training fatigue shows up a day late](figures/fig3_strain_lag.png)
+
+Prior-day strain is the one relationship that a rank correlation, a linear model, and a random forest all agree on: one standard deviation of it costs about ten recovery points. The recovery score is computed at wake, before the day's strain exists, so the direction is expected. What is worth seeing is how clean the lag is.
+
+## Run it
+
+macOS / Linux:
+
+```bash
+python -m venv .venv && source .venv/bin/activate
+pip install -r requirements.txt
+python analyze.py
 ```
-python -m venv .venv && source .venv/bin/activate   # or .venv\Scripts\activate on Windows
+
+Windows (PowerShell):
+
+```powershell
+python -m venv .venv; .venv\Scripts\Activate.ps1
 pip install -r requirements.txt
 python analyze.py
 ```
 
 `analyze.py` reads `data/`, writes `figures/*.png`, `results.md`, and `results.json`, and prints the results table. It runs in a few seconds.
+
+Checked from a clean clone on 2026-09-19 (Python 3.12, fresh virtual environment): `results.md` and `results.json` regenerate byte-for-byte.
 
 ## What's in here
 
