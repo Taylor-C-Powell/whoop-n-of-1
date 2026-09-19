@@ -12,7 +12,7 @@ The first pass produced a satisfying story. Deep sleep was the top predictor of 
 
 Then I fixed a one-line bug in how the two datasets were joined, and about half of it evaporated. This article is the second pass: what survived, what didn't, and why the join key mattered more than any model.
 
-Everything below is one person, 27 usable days, and a lot of tests. Treat every number as a hypothesis to re-test, not a result. The code and data are public so you can check me: **[github.com/Taylor-C-Powell/whoop-n-of-1]** *(link goes live with the repo)*.
+Everything below is one person, 27 usable days, and a lot of tests. Treat every number as a hypothesis to re-test, not a result. The code and data are public so you can check me: **[github.com/Taylor-C-Powell/whoop-n-of-1](https://github.com/Taylor-C-Powell/whoop-n-of-1)**.
 
 ## The bug
 
